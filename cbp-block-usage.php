@@ -248,10 +248,16 @@ class CBP_Block_Usage_Plugin {
 	 * }
 	 */
 	private function get_usage_map(): array {
-		$cached = get_transient( self::TRANSIENT_KEY );
+		// Allow ?cbp_refresh=1 to bypass the cache, e.g. while testing block
+		// discovery changes without waiting for the transient to expire.
+		$force_refresh = isset( $_GET['cbp_refresh'] ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
 
-		if ( is_array( $cached ) ) {
-			return $cached;
+		if ( ! $force_refresh ) {
+			$cached = get_transient( self::TRANSIENT_KEY );
+
+			if ( is_array( $cached ) ) {
+				return $cached;
+			}
 		}
 
 		$blocks = $this->discover_blocks();
@@ -299,7 +305,12 @@ class CBP_Block_Usage_Plugin {
 			'usage'  => $usage,
 		);
 
-		set_transient( self::TRANSIENT_KEY, $map, HOUR_IN_SECONDS );
+		// Don't cache an empty/failed discovery — that would otherwise lock
+		// in a "No blocks found" result for an hour even after the theme or
+		// plugin is fixed.
+		if ( ! empty( $blocks ) ) {
+			set_transient( self::TRANSIENT_KEY, $map, HOUR_IN_SECONDS );
+		}
 
 		return $map;
 	}
@@ -331,6 +342,64 @@ class CBP_Block_Usage_Plugin {
 	}
 
 	/**
+	 * Renders a diagnostic message when no blocks are discovered, listing
+	 * the theme directories that were scanned and whether PHP/block.json
+	 * files were found in them. Only visible to logged-in users who can
+	 * edit posts; everyone else just sees a plain "no blocks" message.
+	 *
+	 * @return string HTML.
+	 */
+	private function render_debug_info(): string {
+		if ( ! current_user_can( 'edit_posts' ) ) {
+			return '<p>No blocks found.</p>';
+		}
+
+		$rows = array();
+
+		foreach ( $this->get_theme_dirs() as $theme_dir ) {
+			$php_count   = count( $this->scan_files( $theme_dir, 'php' ) );
+			$block_jsons = count(
+				array_filter(
+					$this->scan_files( $theme_dir, 'json' ),
+					static function ( $file ) {
+						return basename( $file ) === 'block.json';
+					}
+				)
+			);
+
+			$rows[] = array(
+				'dir'         => $theme_dir,
+				'php_count'   => $php_count,
+				'block_jsons' => $block_jsons,
+			);
+		}
+
+		ob_start();
+		?>
+		<div style="padding: 1.5rem; border: 1px solid #ccc; background: #fafafa;">
+			<p><strong>No blocks found.</strong> (This message is only visible to logged-in users who can edit posts.)</p>
+			<p>Theme directories scanned:</p>
+			<ul>
+				<?php foreach ( $rows as $row ) : ?>
+					<li>
+						<code><?php echo esc_html( $row['dir'] ); ?></code> —
+						<?php echo esc_html( (string) $row['php_count'] ); ?> PHP file(s),
+						<?php echo esc_html( (string) $row['block_jsons'] ); ?> block.json file(s)
+					</li>
+				<?php endforeach; ?>
+			</ul>
+			<p>
+				If PHP files were found but no blocks, check that blocks are registered via
+				<code>acf_register_block()</code>, <code>acf_register_block_type()</code>, or a <code>block.json</code>
+				<code>name</code> field. Add <code>?cbp_refresh=1</code> to this page's URL to bypass the cached result
+				after making changes.
+			</p>
+		</div>
+		<?php
+		return ob_get_clean();
+	}
+
+	/**
 	 * Renders the [block_usage_table] shortcode.
 	 *
 	 * @return string HTML table of block usage, or a message if no blocks are found.
@@ -339,7 +408,7 @@ class CBP_Block_Usage_Plugin {
 		$map = $this->get_usage_map();
 
 		if ( empty( $map['blocks'] ) ) {
-			return '<p>No blocks found.</p>';
+			return $this->render_debug_info();
 		}
 
 		$export_url = wp_nonce_url(
