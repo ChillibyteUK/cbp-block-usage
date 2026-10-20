@@ -47,55 +47,149 @@ class CBP_Block_Usage_Plugin {
 	}
 
 	/**
-	 * Returns the theme directories to scan for a /blocks/ folder.
+	 * Directory names to skip while recursively scanning a theme.
 	 *
-	 * Checks the active (child) theme first, then falls back to the
+	 * @var string[]
+	 */
+	private const SKIP_DIRS = array( 'node_modules', 'vendor', '.git', 'dist', 'build' );
+
+	/**
+	 * Returns the theme root directories to scan.
+	 *
+	 * Checks the active (child) theme first, then also includes the
 	 * parent theme if the site is using a child theme.
 	 *
-	 * @return string[] Absolute paths to each blocks/ directory, trailing slash included.
+	 * @return string[] Absolute theme root paths, trailing slash included.
 	 */
-	private function get_blocks_dirs(): array {
-		$dirs = array( trailingslashit( get_stylesheet_directory() ) . 'blocks/' );
+	private function get_theme_dirs(): array {
+		$dirs = array( trailingslashit( get_stylesheet_directory() ) );
 
 		if ( get_template_directory() !== get_stylesheet_directory() ) {
-			$dirs[] = trailingslashit( get_template_directory() ) . 'blocks/';
+			$dirs[] = trailingslashit( get_template_directory() );
 		}
 
 		return array_values( array_unique( array_filter( $dirs, 'is_dir' ) ) );
 	}
 
 	/**
-	 * Discovers every registered block in the theme(s), supporting both
-	 * JSX blocks (blocks/{slug}/block.json) and ACF blocks
-	 * (blocks/{slug}.php, registered as acf/{slug}).
+	 * Converts a raw ACF block "name" value into the slug WordPress/ACF
+	 * actually registers (and the slug that appears in post content as
+	 * `wp:acf/{slug}`). ACF runs block names through a dash-based slugify,
+	 * so `cb_hero` and `CB Latest Posts Author` both become hyphenated,
+	 * lowercase slugs regardless of how they were written in the source.
 	 *
-	 * @return array<string,array{name:string,slug:string,type:string}> Keyed by full block name (namespace/slug).
+	 * @param string $value Raw name value from the registration call.
+	 * @return string Slugified block name.
 	 */
-	private function discover_blocks(): array {
+	private function slugify( string $value ): string {
+		$value = strtolower( $value );
+		$value = preg_replace( '/[^a-z0-9]+/', '-', $value );
+		return trim( (string) $value, '-' );
+	}
+
+	/**
+	 * Recursively iterates PHP/JSON files under a directory, skipping
+	 * heavy/irrelevant folders such as node_modules and vendor.
+	 *
+	 * @param string $dir      Directory to scan.
+	 * @param string $extension File extension to match, without the dot.
+	 * @return string[] Absolute file paths.
+	 */
+	private function scan_files( string $dir, string $extension ): array {
+		if ( ! is_dir( $dir ) ) {
+			return array();
+		}
+
+		$found    = array();
+		$iterator = new RecursiveIteratorIterator(
+			new RecursiveCallbackFilterIterator(
+				new RecursiveDirectoryIterator( $dir, FilesystemIterator::SKIP_DOTS ),
+				static function ( $file, $key, $iterator ) {
+					if ( $iterator->hasChildren() ) {
+						return ! in_array( $file->getFilename(), self::SKIP_DIRS, true );
+					}
+					return true;
+				}
+			)
+		);
+
+		foreach ( $iterator as $file ) {
+			if ( strtolower( $file->getExtension() ) === $extension ) {
+				$found[] = $file->getPathname();
+			}
+		}
+
+		return $found;
+	}
+
+	/**
+	 * Discovers JSX blocks by locating every block.json in the theme(s)
+	 * and reading its registered "name" field directly.
+	 *
+	 * @param string $theme_dir Theme root directory.
+	 * @return array<string,array{name:string,slug:string,type:string}>
+	 */
+	private function discover_jsx_blocks( string $theme_dir ): array {
 		$blocks = array();
 
-		foreach ( $this->get_blocks_dirs() as $dir ) {
-			// JSX blocks: blocks/{slug}/block.json, registered name comes straight from the file.
-			foreach ( (array) glob( $dir . '*/block.json' ) as $file ) {
-				$data = json_decode( (string) file_get_contents( $file ), true ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_get_contents
+		foreach ( $this->scan_files( $theme_dir, 'json' ) as $file ) {
+			if ( basename( $file ) !== 'block.json' ) {
+				continue;
+			}
 
-				if ( empty( $data['name'] ) ) {
+			$data = json_decode( (string) file_get_contents( $file ), true ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_get_contents
+
+			if ( empty( $data['name'] ) ) {
+				continue;
+			}
+
+			$name = strtolower( $data['name'] );
+
+			$blocks[ $name ] = array(
+				'name' => $name,
+				'slug' => basename( dirname( $file ) ),
+				'type' => 'JSX',
+			);
+		}
+
+		return $blocks;
+	}
+
+	/**
+	 * Discovers ACF blocks by scanning every PHP file in the theme(s) for
+	 * `acf_register_block()` / `acf_register_block_type()` calls and
+	 * extracting the "name" argument actually passed to ACF, rather than
+	 * guessing from the block's filename (the two frequently differ).
+	 *
+	 * @param string $theme_dir Theme root directory.
+	 * @return array<string,array{name:string,slug:string,type:string}>
+	 */
+	private function discover_acf_blocks( string $theme_dir ): array {
+		$blocks = array();
+
+		foreach ( $this->scan_files( $theme_dir, 'php' ) as $file ) {
+			$content = (string) file_get_contents( $file ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_get_contents
+
+			if ( ! preg_match( '/acf_register_block(?:_type)?\s*\(/', $content ) ) {
+				continue;
+			}
+
+			// Split the file on each registration call so we only look for
+			// the "name" belonging to that specific call.
+			$calls = preg_split( '/acf_register_block(?:_type)?\s*\(/', $content );
+
+			foreach ( $calls as $call ) {
+				if ( ! preg_match( '/[\'"]name[\'"]\s*=>\s*[\'"]([^\'"]+)[\'"]/', $call, $match ) ) {
 					continue;
 				}
 
-				$name = strtolower( $data['name'] );
+				$slug = $this->slugify( $match[1] );
 
-				$blocks[ $name ] = array(
-					'name' => $name,
-					'slug' => basename( dirname( $file ) ),
-					'type' => 'JSX',
-				);
-			}
+				if ( '' === $slug ) {
+					continue;
+				}
 
-			// ACF blocks: blocks/{slug}.php, registered as acf/{slug}.
-			foreach ( (array) glob( $dir . '*.php' ) as $file ) {
-				$slug = basename( $file, '.php' );
-				$name = 'acf/' . strtolower( $slug );
+				$name = 'acf/' . $slug;
 
 				if ( isset( $blocks[ $name ] ) ) {
 					continue;
@@ -107,6 +201,25 @@ class CBP_Block_Usage_Plugin {
 					'type' => 'ACF',
 				);
 			}
+		}
+
+		return $blocks;
+	}
+
+	/**
+	 * Discovers every registered block across the active theme (and parent
+	 * theme, if applicable), supporting both JSX blocks (block.json) and
+	 * ACF blocks (acf_register_block / acf_register_block_type calls),
+	 * wherever in the theme they live.
+	 *
+	 * @return array<string,array{name:string,slug:string,type:string}> Keyed by full block name (namespace/slug).
+	 */
+	private function discover_blocks(): array {
+		$blocks = array();
+
+		foreach ( $this->get_theme_dirs() as $theme_dir ) {
+			$blocks += $this->discover_jsx_blocks( $theme_dir );
+			$blocks += $this->discover_acf_blocks( $theme_dir );
 		}
 
 		ksort( $blocks );
