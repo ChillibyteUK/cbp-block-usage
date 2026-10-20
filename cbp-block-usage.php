@@ -23,27 +23,15 @@ class CBP_Block_Usage_Plugin {
 
 	private const EXPORT_ACTION = 'cbp_block_usage_export';
 	private const NONCE_ACTION  = 'cbp_block_usage_export';
-	private const TRANSIENT_KEY = 'cbp_block_usage_map';
 
 	/**
-	 * Constructor. Registers the shortcode, export handler, and cache busting.
+	 * Constructor. Registers the shortcode and export handler.
 	 */
 	public function __construct() {
 		add_shortcode( 'block_usage_table', array( $this, 'render_shortcode' ) );
 
 		add_action( 'admin_post_' . self::EXPORT_ACTION, array( $this, 'handle_export' ) );
 		add_action( 'admin_post_nopriv_' . self::EXPORT_ACTION, array( $this, 'handle_export' ) );
-
-		add_action( 'save_post', array( $this, 'clear_cache' ) );
-		add_action( 'deleted_post', array( $this, 'clear_cache' ) );
-		add_action( 'switch_theme', array( $this, 'clear_cache' ) );
-	}
-
-	/**
-	 * Clears the cached block usage map.
-	 */
-	public function clear_cache() {
-		delete_transient( self::TRANSIENT_KEY );
 	}
 
 	/**
@@ -240,7 +228,8 @@ class CBP_Block_Usage_Plugin {
 	}
 
 	/**
-	 * Builds (or returns the cached) map of block usage across the site.
+	 * Builds the map of block usage across the site. Always computed fresh
+	 * (no caching) so results reflect the current content and theme state.
 	 *
 	 * @return array{
 	 *     blocks: array<string,array{name:string,slug:string,type:string}>,
@@ -248,18 +237,6 @@ class CBP_Block_Usage_Plugin {
 	 * }
 	 */
 	private function get_usage_map(): array {
-		// Allow ?cbp_refresh=1 to bypass the cache, e.g. while testing block
-		// discovery changes without waiting for the transient to expire.
-		$force_refresh = isset( $_GET['cbp_refresh'] ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
-
-		if ( ! $force_refresh ) {
-			$cached = get_transient( self::TRANSIENT_KEY );
-
-			if ( is_array( $cached ) ) {
-				return $cached;
-			}
-		}
-
 		$blocks = $this->discover_blocks();
 
 		$usage = array_fill_keys(
@@ -300,19 +277,10 @@ class CBP_Block_Usage_Plugin {
 			}
 		}
 
-		$map = array(
+		return array(
 			'blocks' => $blocks,
 			'usage'  => $usage,
 		);
-
-		// Don't cache an empty/failed discovery — that would otherwise lock
-		// in a "No blocks found" result for an hour even after the theme or
-		// plugin is fixed.
-		if ( ! empty( $blocks ) ) {
-			set_transient( self::TRANSIENT_KEY, $map, HOUR_IN_SECONDS );
-		}
-
-		return $map;
 	}
 
 	/**
@@ -391,8 +359,7 @@ class CBP_Block_Usage_Plugin {
 			<p>
 				If PHP files were found but no blocks, check that blocks are registered via
 				<code>acf_register_block()</code>, <code>acf_register_block_type()</code>, or a <code>block.json</code>
-				<code>name</code> field. Add <code>?cbp_refresh=1</code> to this page's URL to bypass the cached result
-				after making changes.
+				<code>name</code> field.
 			</p>
 		</div>
 		<?php
